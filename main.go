@@ -40,7 +40,7 @@ func _main() error {
 		lastEight = token[len(token)-8:]
 	}
 
-	login, auths, err := getAuthLogin()
+	login, auths, err := getAuthLogin(org)
 	if err != nil {
 		return err
 	}
@@ -112,7 +112,7 @@ func checkIfUserIsOrgAdmin(org string, login string) (bool, error) {
 	}
 	return isAdmin, nil
 }
-func getAuthLogin() (string, []AuthResponse, error) {
+func getAuthLogin(org string) (string, []AuthResponse, error) {
 	client, err := gh.RESTClient(nil)
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to create client: %w", err)
@@ -123,7 +123,7 @@ func getAuthLogin() (string, []AuthResponse, error) {
 		return "", nil, err
 	}
 	currentUsername := response.Login
-	auths, err := listAuths("pmartindev-test-org")
+	auths, err := listAuths(org)
 	if err != nil {
 		return "", nil, err
 	}
