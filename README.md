@@ -15,9 +15,11 @@ A gh cli extension that a will guide an org admin through the process of revokin
 
 ## Usage 
 
-`gh revoke `
+`gh revoke`
 
 Begins the series of prompts.
+
+![](images/gh-revoke-demo.gif)
 
 ## TODO
 - [ ] support for multiple PATs
