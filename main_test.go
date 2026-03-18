@@ -96,16 +96,39 @@ func TestTokenLastEight(t *testing.T) {
 	}
 }
 
-func TestFindAuthorization(t *testing.T) {
-	auths := []AuthResponse{{Login: "octocat", CredentialID: 9, TokenLastEight: "deadbeef"}}
+func TestFindAllAuthorizations(t *testing.T) {
+	auths := []AuthResponse{
+		{Login: "octocat", CredentialID: 9, TokenLastEight: "deadbeef"},
+		{Login: "monalisa", CredentialID: 10, TokenLastEight: "deadbeef"},
+		{Login: "hubot", CredentialID: 11, TokenLastEight: "cafebabe"},
+	}
 
-	got, found := findAuthorization(auths, "deadbeef")
-	if !found {
-		t.Fatal("expected authorization to be found")
-	}
-	if got.Login != "octocat" || got.CredentialID != 9 {
-		t.Fatalf("unexpected authorization returned: %+v", got)
-	}
+	t.Run("single match", func(t *testing.T) {
+		matches := findAllAuthorizations(auths, "cafebabe")
+		if len(matches) != 1 {
+			t.Fatalf("expected 1 match, got %d", len(matches))
+		}
+		if matches[0].Login != "hubot" {
+			t.Fatalf("expected hubot, got %s", matches[0].Login)
+		}
+	})
+
+	t.Run("multiple matches", func(t *testing.T) {
+		matches := findAllAuthorizations(auths, "deadbeef")
+		if len(matches) != 2 {
+			t.Fatalf("expected 2 matches, got %d", len(matches))
+		}
+		if matches[0].Login != "octocat" || matches[1].Login != "monalisa" {
+			t.Fatalf("unexpected matches: %+v", matches)
+		}
+	})
+
+	t.Run("no match", func(t *testing.T) {
+		matches := findAllAuthorizations(auths, "notfound")
+		if len(matches) != 0 {
+			t.Fatalf("expected 0 matches, got %d", len(matches))
+		}
+	})
 }
 
 func TestGetAuthLoginSuccess(t *testing.T) {
@@ -241,12 +264,204 @@ func TestPromptForOrgHandlesInterrupt(t *testing.T) {
 		return terminal.InterruptErr
 	})
 
-	_, err := promptForOrg(context.Background())
+	_, err := promptForOrg(context.Background(), nil)
 	if err == nil {
 		t.Fatal("expected promptForOrg() to return an error")
 	}
 	if err != errCancelled {
 		t.Fatalf("expected cancellation error, got %v", err)
+	}
+}
+
+func TestPromptForOrgSelectsSuggestion(t *testing.T) {
+	useMockSurveyAskOne(t, func(prompt survey.Prompt, response interface{}, opts ...survey.AskOpt) error {
+		if sel, ok := prompt.(*survey.Select); ok {
+			if sel.Message != "Select the org you want to revoke access to:" {
+				return fmt.Errorf("unexpected select message: %s", sel.Message)
+			}
+			*(response.(*string)) = "acme"
+			return nil
+		}
+		return fmt.Errorf("unexpected prompt type: %T", prompt)
+	})
+
+	org, err := promptForOrg(context.Background(), []string{"acme", "globex"})
+	if err != nil {
+		t.Fatalf("promptForOrg() error = %v", err)
+	}
+	if org != "acme" {
+		t.Fatalf("promptForOrg() = %q, want %q", org, "acme")
+	}
+}
+
+func TestPromptForOrgManualEntryFromSuggestions(t *testing.T) {
+	calls := 0
+	useMockSurveyAskOne(t, func(prompt survey.Prompt, response interface{}, opts ...survey.AskOpt) error {
+		calls++
+		switch calls {
+		case 1:
+			// First call: select prompt, user picks manual entry
+			*(response.(*string)) = enterManuallyOption
+			return nil
+		case 2:
+			// Second call: input prompt for manual org name
+			*(response.(*string)) = "custom-org"
+			return nil
+		default:
+			return fmt.Errorf("unexpected call %d", calls)
+		}
+	})
+
+	org, err := promptForOrg(context.Background(), []string{"acme"})
+	if err != nil {
+		t.Fatalf("promptForOrg() error = %v", err)
+	}
+	if org != "custom-org" {
+		t.Fatalf("promptForOrg() = %q, want %q", org, "custom-org")
+	}
+	if calls != 2 {
+		t.Fatalf("expected 2 prompt calls, got %d", calls)
+	}
+}
+
+func TestPromptForOrgNoSuggestionsFallsBackToInput(t *testing.T) {
+	useMockSurveyAskOne(t, func(prompt survey.Prompt, response interface{}, opts ...survey.AskOpt) error {
+		if _, ok := prompt.(*survey.Input); !ok {
+			return fmt.Errorf("expected Input prompt when no suggestions, got %T", prompt)
+		}
+		*(response.(*string)) = "typed-org"
+		return nil
+	})
+
+	org, err := promptForOrg(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("promptForOrg() error = %v", err)
+	}
+	if org != "typed-org" {
+		t.Fatalf("promptForOrg() = %q, want %q", org, "typed-org")
+	}
+}
+
+func TestPromptForContinue(t *testing.T) {
+	useMockSurveyAskOne(t, func(prompt survey.Prompt, response interface{}, opts ...survey.AskOpt) error {
+		c, ok := prompt.(*survey.Confirm)
+		if !ok {
+			return fmt.Errorf("expected Confirm prompt, got %T", prompt)
+		}
+		if c.Message != "test message" {
+			return fmt.Errorf("unexpected message: %s", c.Message)
+		}
+		*(response.(*bool)) = true
+		return nil
+	})
+
+	result, err := promptForContinue(context.Background(), "test message")
+	if err != nil {
+		t.Fatalf("promptForContinue() error = %v", err)
+	}
+	if !result {
+		t.Fatal("expected promptForContinue() to return true")
+	}
+}
+
+func TestPromptForCredentialSelection(t *testing.T) {
+	matches := []AuthResponse{
+		{Login: "octocat", CredentialID: 9, CredentialType: "personal access token"},
+		{Login: "monalisa", CredentialID: 10, CredentialType: "personal access token"},
+	}
+
+	useMockSurveyAskOne(t, func(prompt survey.Prompt, response interface{}, opts ...survey.AskOpt) error {
+		sel, ok := prompt.(*survey.Select)
+		if !ok {
+			return fmt.Errorf("expected Select prompt, got %T", prompt)
+		}
+		if len(sel.Options) != 2 {
+			return fmt.Errorf("expected 2 options, got %d", len(sel.Options))
+		}
+		// Select the second option
+		*(response.(*string)) = sel.Options[1]
+		return nil
+	})
+
+	auth, err := promptForCredentialSelection(context.Background(), matches)
+	if err != nil {
+		t.Fatalf("promptForCredentialSelection() error = %v", err)
+	}
+	if auth.Login != "monalisa" || auth.CredentialID != 10 {
+		t.Fatalf("unexpected auth selected: %+v", auth)
+	}
+}
+
+func TestPromptForCredentialSelectionInterrupt(t *testing.T) {
+	useMockSurveyAskOne(t, func(prompt survey.Prompt, response interface{}, opts ...survey.AskOpt) error {
+		return terminal.InterruptErr
+	})
+
+	_, err := promptForCredentialSelection(context.Background(), []AuthResponse{
+		{Login: "octocat", CredentialID: 9},
+	})
+	if err != errCancelled {
+		t.Fatalf("expected cancellation error, got %v", err)
+	}
+}
+
+func TestListUserOrgsWithClient(t *testing.T) {
+	client := mockRESTClient{doWithContext: func(ctx context.Context, method, path string, body io.Reader, response interface{}) error {
+		if path != "user/orgs" {
+			return fmt.Errorf("unexpected path: %s", path)
+		}
+		resp := response.(*[]OrgResponse)
+		*resp = []OrgResponse{{Login: "acme"}, {Login: "globex"}}
+		return nil
+	}}
+
+	orgs, err := listUserOrgsWithClient(context.Background(), client)
+	if err != nil {
+		t.Fatalf("listUserOrgsWithClient() error = %v", err)
+	}
+	if len(orgs) != 2 || orgs[0].Login != "acme" || orgs[1].Login != "globex" {
+		t.Fatalf("unexpected orgs: %+v", orgs)
+	}
+}
+
+func TestListUserOrgsWithClientError(t *testing.T) {
+	client := mockRESTClient{doWithContext: func(ctx context.Context, method, path string, body io.Reader, response interface{}) error {
+		return api.HTTPError{StatusCode: http.StatusUnauthorized, Message: "Bad credentials"}
+	}}
+
+	_, err := listUserOrgsWithClient(context.Background(), client)
+	if err == nil {
+		t.Fatal("expected listUserOrgsWithClient() to return an error")
+	}
+	if !strings.Contains(err.Error(), "authentication failed") {
+		t.Fatalf("expected auth error, got %v", err)
+	}
+}
+
+func TestFetchOrgSuggestionsReturnsNames(t *testing.T) {
+	useMockRESTClient(t, mockRESTClient{doWithContext: func(ctx context.Context, method, path string, body io.Reader, response interface{}) error {
+		if path == "user/orgs" {
+			resp := response.(*[]OrgResponse)
+			*resp = []OrgResponse{{Login: "acme"}, {Login: "globex"}}
+			return nil
+		}
+		return fmt.Errorf("unexpected path: %s", path)
+	}})
+
+	names := fetchOrgSuggestions(context.Background())
+	if len(names) != 2 || names[0] != "acme" || names[1] != "globex" {
+		t.Fatalf("unexpected suggestions: %v", names)
+	}
+}
+
+func TestFetchOrgSuggestionsReturnsNilOnError(t *testing.T) {
+	useMockRESTClient(t, mockRESTClient{doWithContext: func(ctx context.Context, method, path string, body io.Reader, response interface{}) error {
+		return api.HTTPError{StatusCode: http.StatusUnauthorized}
+	}})
+
+	names := fetchOrgSuggestions(context.Background())
+	if names != nil {
+		t.Fatalf("expected nil on error, got %v", names)
 	}
 }
 

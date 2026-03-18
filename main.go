@@ -20,6 +20,7 @@ import (
 const (
 	fullTokenLength      = 40
 	tokenLastEightLength = 8
+	enterManuallyOption  = "[Enter a different org name]"
 )
 
 var (
@@ -33,23 +34,19 @@ func _main() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
-	org, err := promptForOrg(ctx)
-	if err != nil {
-		return err
-	}
+	orgSuggestions := fetchOrgSuggestions(ctx)
 
-	token, err := promptForToken(ctx)
+	org, err := promptForOrg(ctx, orgSuggestions)
 	if err != nil {
 		return err
 	}
-	lastEight := tokenLastEight(token)
 
 	for {
 		login, auths, err := getAuthLogin(ctx, org)
 		if err != nil {
 			if shouldRepromptOrg(err) {
 				fmt.Fprintf(os.Stderr, "! %s\n", err)
-				org, err = promptForOrg(ctx)
+				org, err = promptForOrg(ctx, orgSuggestions)
 				if err != nil {
 					return err
 				}
@@ -64,17 +61,23 @@ func _main() error {
 		}
 		if !isAdmin {
 			fmt.Fprintf(os.Stderr, "! %s is not an admin of %q. Try another organization.\n", login, org)
-			org, err = promptForOrg(ctx)
+			org, err = promptForOrg(ctx, orgSuggestions)
 			if err != nil {
 				return err
 			}
 			continue
 		}
 
-		refreshOrg := false
+		token, err := promptForToken(ctx)
+		if err != nil {
+			return err
+		}
+		lastEight := tokenLastEight(token)
+
+		switchOrg := false
 		for {
-			auth, found := findAuthorization(auths, lastEight)
-			if !found {
+			matches := findAllAuthorizations(auths, lastEight)
+			if len(matches) == 0 {
 				fmt.Fprintf(os.Stderr, "! No credential authorization ending in %s was found for %q.\n", lastEight, org)
 				token, err = promptForToken(ctx)
 				if err != nil {
@@ -86,11 +89,11 @@ func _main() error {
 				if err != nil {
 					if shouldRepromptOrg(err) {
 						fmt.Fprintf(os.Stderr, "! %s\n", err)
-						org, err = promptForOrg(ctx)
+						org, err = promptForOrg(ctx, orgSuggestions)
 						if err != nil {
 							return err
 						}
-						refreshOrg = true
+						switchOrg = true
 						break
 					}
 					return err
@@ -98,7 +101,17 @@ func _main() error {
 				continue
 			}
 
-			fmt.Printf("✓ Token found for user: %s\n", auth.Login)
+			var auth AuthResponse
+			if len(matches) == 1 {
+				auth = matches[0]
+				fmt.Printf("✓ Token found for user: %s (credential type: %s)\n", auth.Login, auth.CredentialType)
+			} else {
+				fmt.Printf("✓ Found %d credentials ending in %s\n", len(matches), lastEight)
+				auth, err = promptForCredentialSelection(ctx, matches)
+				if err != nil {
+					return err
+				}
+			}
 
 			confirm, err := promptForConfirmation(ctx, auth.Login)
 			if err != nil {
@@ -113,18 +126,96 @@ func _main() error {
 			}
 
 			fmt.Printf("✓ Token revoked for user: %s\n", auth.Login)
-			return nil
+
+			another, err := promptForContinue(ctx, "Would you like to revoke another token?")
+			if err != nil {
+				return err
+			}
+			if !another {
+				return nil
+			}
+
+			sameOrg, err := promptForContinue(ctx, fmt.Sprintf("Continue with organization %q?", org))
+			if err != nil {
+				return err
+			}
+			if !sameOrg {
+				org, err = promptForOrg(ctx, orgSuggestions)
+				if err != nil {
+					return err
+				}
+				switchOrg = true
+				break
+			}
+
+			// Refresh authorizations for continued work in the same org
+			auths, err = listAuths(ctx, org)
+			if err != nil {
+				if shouldRepromptOrg(err) {
+					fmt.Fprintf(os.Stderr, "! %s\n", err)
+					org, err = promptForOrg(ctx, orgSuggestions)
+					if err != nil {
+						return err
+					}
+					switchOrg = true
+					break
+				}
+				return err
+			}
+
+			token, err = promptForToken(ctx)
+			if err != nil {
+				return err
+			}
+			lastEight = tokenLastEight(token)
 		}
-		if refreshOrg {
+		if switchOrg {
 			continue
 		}
 	}
 }
 
-func promptForOrg(ctx context.Context) (string, error) {
+// fetchOrgSuggestions returns the authenticated user's org names for use as
+// prompt suggestions. Errors are silently ignored since suggestions are optional.
+func fetchOrgSuggestions(ctx context.Context) []string {
+	client, err := restClient()
+	if err != nil {
+		return nil
+	}
+	orgs, err := listUserOrgsWithClient(ctx, client)
+	if err != nil {
+		return nil
+	}
+	names := make([]string, len(orgs))
+	for i, o := range orgs {
+		names[i] = o.Login
+	}
+	return names
+}
+
+func promptForOrg(ctx context.Context, suggestions []string) (string, error) {
 	for {
 		if err := contextErr(ctx); err != nil {
 			return "", err
+		}
+
+		if len(suggestions) > 0 {
+			options := make([]string, 0, len(suggestions)+1)
+			options = append(options, suggestions...)
+			options = append(options, enterManuallyOption)
+
+			selected := ""
+			err := surveyAskOne(&survey.Select{
+				Message: "Select the org you want to revoke access to:",
+				Options: options,
+			}, &selected)
+			if err != nil {
+				return "", normalizePromptError(err)
+			}
+
+			if selected != enterManuallyOption {
+				return selected, nil
+			}
 		}
 
 		org := ""
@@ -187,6 +278,49 @@ func promptForConfirmation(ctx context.Context, login string) (bool, error) {
 	return confirm, nil
 }
 
+func promptForContinue(ctx context.Context, message string) (bool, error) {
+	if err := contextErr(ctx); err != nil {
+		return false, err
+	}
+
+	confirm := false
+	err := surveyAskOne(&survey.Confirm{
+		Message: message,
+	}, &confirm)
+	if err != nil {
+		return false, normalizePromptError(err)
+	}
+
+	return confirm, nil
+}
+
+func promptForCredentialSelection(ctx context.Context, matches []AuthResponse) (AuthResponse, error) {
+	if err := contextErr(ctx); err != nil {
+		return AuthResponse{}, err
+	}
+
+	options := make([]string, len(matches))
+	for i, m := range matches {
+		options[i] = fmt.Sprintf("%s (credential ID: %d, type: %s)", m.Login, m.CredentialID, m.CredentialType)
+	}
+
+	selected := ""
+	err := surveyAskOne(&survey.Select{
+		Message: "Multiple credentials found. Select the one to revoke:",
+		Options: options,
+	}, &selected)
+	if err != nil {
+		return AuthResponse{}, normalizePromptError(err)
+	}
+
+	for i, opt := range options {
+		if opt == selected {
+			return matches[i], nil
+		}
+	}
+	return AuthResponse{}, fmt.Errorf("selected credential not found")
+}
+
 func normalizePromptError(err error) error {
 	if err == nil {
 		return nil
@@ -220,6 +354,10 @@ type MembershipResponse struct {
 	} `json:"organization"`
 }
 
+type OrgResponse struct {
+	Login string `json:"login"`
+}
+
 func checkIfUserIsOrgAdmin(ctx context.Context, org, login string) (bool, error) {
 	client, err := restClient()
 	if err != nil {
@@ -240,6 +378,15 @@ func checkIfUserIsOrgAdminWithClient(ctx context.Context, client api.RESTClient,
 	}
 
 	return strings.EqualFold(response.Organization.Login, org) && response.Role == "admin", nil
+}
+
+func listUserOrgsWithClient(ctx context.Context, client api.RESTClient) ([]OrgResponse, error) {
+	var response []OrgResponse
+	err := client.DoWithContext(ctx, http.MethodGet, "user/orgs", nil, &response)
+	if err != nil {
+		return nil, formatRequestError("list your organizations", err)
+	}
+	return response, nil
 }
 
 func getAuthLogin(ctx context.Context, org string) (string, []AuthResponse, error) {
@@ -408,13 +555,14 @@ func tokenLastEight(token string) string {
 	return token[len(token)-tokenLastEightLength:]
 }
 
-func findAuthorization(auths []AuthResponse, lastEight string) (AuthResponse, bool) {
+func findAllAuthorizations(auths []AuthResponse, lastEight string) []AuthResponse {
+	var matches []AuthResponse
 	for _, auth := range auths {
 		if auth.TokenLastEight == lastEight {
-			return auth, true
+			matches = append(matches, auth)
 		}
 	}
-	return AuthResponse{}, false
+	return matches
 }
 
 func main() {
